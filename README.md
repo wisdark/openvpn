@@ -4,6 +4,11 @@ This [ansible](http://docs.ansible.com/ansible/latest/intro_installation.html) s
 There is no bul**hit, no unnecessary clunky software, it's based on [OpenBSD](http://www.openbsd.org), simple ansible playbook, easy as any kid can read. 
 Once playbook finish, you have ready to use 2 archives with configs and all what is needed to connect to your VPN: one config is for Desktop Viscosity app and second for iPhone OpenVPN app (_ovpn_). You can easily create more keypairs/config for more users and adapt to your needs. Really simple, see below for usage.
 
+## UDP branch
+**If you do not care about paranoid privacy mode and internet speed is important to you, please check [udp-noscrable](https://github.com/kolargol/openvpn/tree/udp-noscramble) branch. UDP branch uses same security measures as master branch but remove scramblesuit and use much faster UDP mode**
+
+**WARNING: scramblesuit is currently not maintained, please use [udp-noscrable](https://github.com/kolargol/openvpn/tree/udp-noscramble) instead. If you want to backport changes from udp-noscrable branch, please create pull request - should be fair easy.** 
+
 ## Why ?
 Because other solutions are crap. So called "_private_" VPNs that are sold are no private - you let **unknown party** to watch _all_ your traffic, they sell it to Ad companies or do what they want with _your_ data. It's really stupid and people are unaware of this.
 This playbook guarantee that your data on transit are safe, server _do not_ store anything related with traffic or DNS queries, even in unlikely breach to your VPN server attacker won't be able to do anything that could harm your data (_of course once you realize server was pwned_). Read below why using VPN on your mobile and desktop is important.
@@ -46,7 +51,7 @@ Here is list of cloud providers with support for OpenBSD:
 
 * [Exoscale](https://portal.exoscale.ch/register?r=gLrEOdv5hVgv) (*tested*)
 * [Vultr](https://www.vultr.com/?ref=7207673) (*tested*)
-* [AWS](https://aws.amazon.com)(*tested - do not work out-of-the-box, as non-standard config is used*)
+* [AWS](https://aws.amazon.com) (*works with eu-west-1 **ami-bc78bfc5** and us-east-1 ***ami-5845a022*** : made from [my recipe](https://github.com/kolargol/openbsd-aws)*)
 * [Azure](https://azure.microsoft.com/en-us/) (*not tested*)
 * [Tilaa](https://www.tilaa.com/en/vps-software) (*not tested*)
 * [TransIP](https://www.transip.eu/vps/openbsd/) (*not tested*)
@@ -66,6 +71,7 @@ Below simple requirements to run your own VPN server
 * pretty much that's all
 
 ### Steps to start your own OpenVPN server from ansible playbook:
+* Download release from: https://github.com/kolargol/openvpn/tags (*you can also clone but releases are always tested and signed with [my gpg key](http://pgp.mit.edu/pks/lookup?op=vindex&search=0xE83413E79DB62E31), it is recommended way obtaining playbook*)
 * edit *private_vpn_inventory* and replace **IP_OF_YOUR_SERVER** with IP of your cloud server (easy?)
 * run ansible with command: **ansible-playbook -i private_vpn_inventory openvpn.yml**
 * after ansible finish without error your server is ready to use
@@ -93,21 +99,29 @@ on the server, go to: */etc/openvpn/easy-rsa/* and type:
 
 **Note:** as you can see private keys are generated *without* password, you can password-protect them by removing **nopass** option. You will be asked for password and this is **recommended** way of generating keypair. I use nopass just for the convenience of the playbook. Also, for god sake **do not send keypairs via email or any other crazy way** without properly encrypting them, best - set password on key and wrap up by some gpg.
 
-Once you understood all, let's generate packages with config, easy like 1,2,3...: go to: */etc/openvpn/export/* and symlink all new keypairs into export folder: **ln -s /etc/openvpn/easy-rsa/pki/issued/privateVPN\* .** and **ln -s /etc/openvpn/easy-rsa/pki/private/privateVPN\* .** then for each user run: **./gen_config.sh privateVPN-Desktop-USERNAME** packages are put into *archives/* folder. Copy to localhosts, share, install, enjoy.
+Once you understood all, let's generate packages with config, easy like 1,2,3...: go to: */etc/openvpn/export/* and for each user run: **./gen_config.sh privateVPN-Desktop-USERNAME** packages are put into *archives/* folder. Copy to localhosts, share, install, enjoy.
+
+You can also use this crazy loop to create packages for all issued certificates:
+```
+ls -all /etc/openvpn/easy-rsa/pki/issued/privateVPN-* | cut -d/ -f 7 | cut -d. -f1 | while read cert; do ./gen_config.sh $cert; done
+```
 
 That's all. 
 
 
 ### Client Configuration
 
-Desktop config creates IPv4: 172.17.200.0/24 and IPv6: fdd5:b0c4:f9fb:fa1f::/6 network, access on port 80
+Desktop config creates **IPv4**: 172.17.200.0/24 and **IPv6**: fdd5:b0c4:f9fb:fa1f::/6 network, access on port 80
 
-Mobile config creates IPv4: 172.16.200.0/24 and IPv6: fdd5:b0c4:f9fb:fa1e::/6 network, access on port 443
+Mobile config creates **IPv4**: 172.16.200.0/24 and **IPv6**: fdd5:b0c4:f9fb:fa1e::/6 network, access on port 443
 
 ### Known issues and workarounds
 
 #### DNS stop working after when OpenVPN process is restarted
 This happens because DNS server process lose bind after openvpn is stopped. To fix this, after restarting OpenVPN process, restart bind with command **rcctl restart isc_named**
+
+#### Ansible fails after waiting for instance restart
+Sometimes instance take longer then 2 minutes to restart after applying erratas. Just reply ansible command/playbook or if problem persist alter timeout in playbok in restart task
 
 ### Customizations
 

@@ -3,6 +3,7 @@
   gather_facts: False
   vars:
     ca_name: unused
+    crypto_curve: secp521r1
   tasks:
     - name: Create installurl with repos
       raw: echo "http://mirror.switch.ch/ftp/pub/OpenBSD" > /etc/installurl
@@ -33,6 +34,34 @@
         - sndiod
       tags:
         - disable_services
+    - name: Detect interface name
+      shell: basename /etc/hostname.*|cut -d. -f2
+      register: ifname
+      tags:
+        - install_packages
+        - detect_iface
+        - is_aws
+      # Assume, possibly wrong... that xnf0 is AWS specyfic as xnf0 is xen ifname,
+    - name: Install dhcpcd only on AWS (xnf0) instance
+      openbsd_pkg: name=dhcpcd state=present
+      when: ifname.stdout == "xnf0"
+      tags:
+        - install_packages
+        - detect_iface
+    - name: Use dhcpcd only for IPv6
+      shell: echo -e "ipv6only\nnohook resolv.conf" >> /etc/dhcpcd.conf
+      when: ifname.stdout == "xnf0"
+      tags:
+        - install_packages
+        - basesystem_config
+        - detect_iface
+    - name: Enable dhcpcd
+      shell: rcctl enable dhcpcd
+      when: ifname.stdout == "xnf0"
+      tags:
+        - install_packages
+        - basesystem_config
+        - detect_iface
     - name: Rebooting machine after updates
       shell: sleep 2 && shutdown -r now "Ansible updates triggered"
       async: 1
@@ -40,7 +69,7 @@
       ignore_errors: true
       when: bsd_updated.changed
     - name: Waiting for machine to get back (this make take some time...)
-      local_action: wait_for host={{ ansible_ssh_host }} port=22 state=started delay=30 timeout=60
+      local_action: wait_for host={{ ansible_ssh_host }} port=22 state=started delay=120 timeout=120
       become: false
       when: bsd_updated.changed
     - name: Install required packages
@@ -81,7 +110,7 @@
         - { dir: /etc/openvpn/jail/ccd, owner: root, group: wheel }
         - { dir: /etc/openvpn/jail/tmp, owner: root, group: wheel }
         - { dir: /etc/openvpn/status, owner: root, group: wheel }
-        - { dir: /var/named/var/cache/bind, owner: root, group: _bind }
+        - { dir: /var/named/var/cache/bind, owner: _bind, group: _bind }
         - { dir: /etc/openvpn/export/archives, owner: root, group: wheel }
         - { dir: /etc/openvpn/export/privateVPN-Desktop.visc, owner: root, group: wheel }
       tags:
@@ -100,22 +129,39 @@
         - { src: openvpn.init, dst: /etc/rc.d/openvpn, owner: root, group: wheel, mode: "ugo+x,go-w" }
         - { src: obfs.init, dst: /etc/rc.d/obfs, owner: root, group: wheel, mode: "ugo+x,go-w" }
         - { src: rc.conf.local, dst: /etc/rc.conf.local, owner: root, group: wheel, mode: "u+rw,go+r" }
-        - { src: pf.conf, dst: /etc/pf.conf, owner: root, group: wheel, mode: "u+rw,go-rwx" }
         - { src: gen_config.sh, dst: /etc/openvpn/export, owner: root, group: wheel, mode: "u+rwx,go-rwx" }
         - { src: privateVPN-Desktop.visc/config.conf, dst: /etc/openvpn/export/privateVPN-Desktop.visc/config.conf, owner: root, group: wheel, mode: "u+rwx,go-rwx" }
         - { src: privateVPN-Mobile.ovpn.template, dst: /etc/openvpn/export/privateVPN-Mobile.ovpn.template, owner: root, group: wheel, mode: "u+rwx,go-rwx" }
       tags:
         - copy_configs
         - basesystem_config
+    - name: Generate pf config file
+      template: src=files/pf.j2 dest=/etc/pf.conf owner=root group=wheel
+      tags:
+        - copy_configs
+    - name: Update listening IP - Others
+      shell: ifconfig {{ ifname.stdout }}|grep inet|grep -v inet6|awk '{ print $2}'|xargs -I xxx sed -i 's/[[:<:]]LISTEN_IP[[:>:]]/xxx/g'
+               /etc/openvpn/export/privateVPN-Desktop.visc/config.conf
+               /etc/openvpn/export/privateVPN-Mobile.ovpn.template
+      when: ifname.stdout == "vio0"
+      tags:
+        - update_templates
+        - copy_configs
+    - name: Update listening IP - AWS
+      shell: ftp -MVo - http://169.254.169.254/latest/meta-data/public-ipv4|xargs -I xxx sed -i 's/[[:<:]]LISTEN_IP[[:>:]]/xxx/g'
+               /etc/openvpn/export/privateVPN-Desktop.visc/config.conf
+               /etc/openvpn/export/privateVPN-Mobile.ovpn.template
+      when: ifname.stdout == "xnf0"
+      tags:
+        - update_templates
+        - copy_configs
     - name: Let's do some sed's on the template files
       shell: "{{ item }}"
       with_items:
-        - ifconfig vio0 | grep inet | grep -v inet6 | awk '{ print $2}' | xargs -I xxx sed -i s/LISTEN_IP/xxx/g 
+        - ifconfig {{ ifname.stdout }} | grep inet | grep -v inet6 | awk '{ print $2}' | xargs -I xxx sed -i 's/[[:<:]]LISTEN_IP[[:>:]]/xxx/g'
             /etc/rc.d/obfs
             /etc/openvpn/privateVPN-Mobile.conf
             /etc/pf.conf
-            /etc/openvpn/export/privateVPN-Desktop.visc/config.conf
-            /etc/openvpn/export/privateVPN-Mobile.ovpn.template
         - apg -a 1 -m 32 -MC -n1 | xargs -I xxx sed -i s/SCRAMBLE_SECRET/xxx/g /etc/rc.d/obfs /etc/openvpn/export/privateVPN-Desktop.visc/config.conf
         - hostname | xargs -I xxx sed -i s/SERVER_CERT/PrivateVPN-xxx_ECC/g /etc/openvpn/privateVPN-Desktop.conf
         - hostname | xargs -I xxx sed -i s/SERVER_CERT/PrivateVPN-xxx_RSA/g /etc/openvpn/privateVPN-Mobile.conf
@@ -127,13 +173,13 @@
       tags:
         - create_obfs_user
       # Have better idea? Create pull request...
-    - name: Detect if IPv6 is up on vio0
-      shell: ifconfig vio0|sed -n '/inet6/p'|wc -l|sed -e 's/^[ \t]*//'
+    - name: Detect if IPv6 is up on {{ ifname.stdout }}
+      shell: ifconfig {{ ifname.stdout }}|sed -n '/inet6/p'|grep -v "inet6 fe80:"|wc -l|sed -e 's/^[ \t]*//'
       register: ipv6is
       tags:
         - reload_pf
     - name: Get IPv6 address
-      shell: ifconfig vio0|grep inet6|egrep -v -e "inet6 fe80:" -e autoconfprivacy|awk '{ print $2}'
+      shell: ifconfig {{ ifname.stdout }}|grep inet6|egrep -v -e "inet6 fe80:" -e autoconfprivacy|awk '{ print $2}'
       register: ipv6addr
       when: ipv6is.stdout != "0"
       tags:
@@ -141,7 +187,7 @@
     - name: If IPv6 is present add additional rules to pf and place IPv6 address
       shell: "{{ item }}"
       with_items:
-        - echo "pass out on vio0 from fdd5:b0c4:f9fb:fa1f::/64 to any nat-to \$ext_ip_6\npass out on vio0 from fdd5:b0c4:f9fb:fa1e::/64 to any nat-to \$ext_ip_6" >> /etc/pf.conf
+        - echo "pass out on {{ ifname.stdout }} from fdd5:b0c4:f9fb:fa1f::/64 to any nat-to \$ext_ip_6\npass out on {{ ifname.stdout }} from fdd5:b0c4:f9fb:fa1e::/64 to any nat-to \$ext_ip_6" >> /etc/pf.conf
         - sed -i s/LISTEN_IPv6/{{ ipv6addr.stdout }}/g /etc/pf.conf
       when: ipv6is.stdout != "0"
       tags:
@@ -155,8 +201,8 @@
       with_items:
         - ./easyrsa init-pki
         - ./easyrsa gen-dh
-        - apg -a 1 -m 6 -MCL -n1 | xargs -I xxx ./easyrsa --batch --req-cn="privateVPN CA (xxx)" --use-algo=ec --curve=secp521r1 build-ca nopass
-        - hostname | xargs -I xxx ./easyrsa --use-algo=ec --curve=secp521r1 build-server-full "PrivateVPN-xxx_ECC" nopass
+        - apg -a 1 -m 6 -MCL -n1 | xargs -I xxx ./easyrsa --batch --req-cn="privateVPN CA (xxx)" --use-algo=ec --curve={{ crypto_curve }} build-ca nopass
+        - hostname | xargs -I xxx ./easyrsa --use-algo=ec --curve={{ crypto_curve }} build-server-full "PrivateVPN-xxx_ECC" nopass
         - hostname | xargs -I xxx ./easyrsa --use-algo=rsa --ns-cert=yes  build-server-full "PrivateVPN-xxx_RSA" nopass
       tags:
         - create_pki
@@ -167,7 +213,7 @@
       shell: chdir=/etc/openvpn/easy-rsa/ {{ item }}
       with_items:
         - ./easyrsa --use-algo=rsa build-client-full privateVPN-Mobile-JohnDoe nopass
-        - ./easyrsa --use-algo=ec --curve=secp521r1 build-client-full privateVPN-Desktop-JohnDoe nopass
+        - ./easyrsa --use-algo=ec --curve={{ crypto_curve }} build-client-full privateVPN-Desktop-JohnDoe nopass
       tags:
         - gen_client_certs
     - name: Create shared-secret for TLSauth(RSA) and TLScrypt(ECC)
@@ -201,18 +247,6 @@
         - sed -i s/CA_HASH/{{ ca_sha1.stdout }}/g /etc/openvpn/export/privateVPN-Mobile.ovpn.template
       tags:
         - update_ca_hash
-      # Yes, I can use file module here but i rather use shell for link unknown number of certs with pattern, feel free to fix it
-    - name: Link generated certificates, keys and stuff to export folder for client package generation
-      shell: chdir=/etc/openvpn/export/ {{ item }}
-      with_items:
-        - ln -s /etc/openvpn/easy-rsa/pki/issued/privateVPN* .
-        - ln -s /etc/openvpn/easy-rsa/pki/private/privateVPN* .
-        - ln -s /etc/openvpn/easy-rsa/pki/ca.crt .
-        - ln -s /etc/openvpn/easy-rsa/pki/ta.key .
-      ignore_errors: yes
-      tags:
-        - make_cert_links
-        - gen_package_vpn  
     # I do not care for other entries in sysctl.conf as we do it for this playbook purpose, feel free to make it better ;)
     - name: Enable forwarding and make it permement
       shell: "{{ item }}"
